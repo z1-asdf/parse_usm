@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <iosfwd>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <ostream>
 #include <sstream>
@@ -18,22 +19,16 @@
 #include <windows.h>
 #endif
 
-#include "vp9_header_parser.cpp"
+#include "vp9_header_parser.h"
 // 說明 原bytes -> 00 01 02 03
 // BIG -> 00 01 02 03
 // LITTLE -> 03 02 01 00
 enum class ENDIAN { BIG, LITTLE };
 
-// ------------------------------------------------------------
-// 指標版本的多位元組讀取函式。
-// 傳入的 ptr 是一個「參照到指標」(reference to pointer)，讀取完成後
-// ptr 會自動往前移動 sizeof(uint_type) bytes，這樣呼叫端只要
-// 依序呼叫這個函式，就能像用游標一樣往前掃過整塊記憶體，
-// 不再需要自己手動維護 offset 變數、也不用每次都重新計算
-// data.data() + offset。
-// ------------------------------------------------------------
+// 不移動指標的版本（單純窺視某個位置的值），保留給少數需要
+// 「先看但不前進」的情境使用。
 template <typename uint_type>
-uint_type ptr_to_uint(const uint8_t *&ptr, ENDIAN endian = ENDIAN::BIG) {
+uint_type peek_uint(const uint8_t *ptr, ENDIAN endian = ENDIAN::BIG) {
   static_assert(std::is_unsigned<uint_type>::value, "只允許 unsigned 數字類別");
   constexpr size_t byteCount = sizeof(uint_type);
 
@@ -51,16 +46,22 @@ uint_type ptr_to_uint(const uint8_t *&ptr, ENDIAN endian = ENDIAN::BIG) {
     throw std::logic_error("未知的endian類別");
   }
 
-  ptr += byteCount; // 讀取完自動前進，模擬「游標」的行為
   return result;
 }
 
-// 不移動指標的版本（單純窺視某個位置的值），保留給少數需要
-// 「先看但不前進」的情境使用。
+// ------------------------------------------------------------
+// 指標版本的多位元組讀取函式。
+// 傳入的 ptr 是一個「參照到指標」(reference to pointer)，讀取完成後
+// ptr 會自動往前移動 sizeof(uint_type) bytes，這樣呼叫端只要
+// 依序呼叫這個函式，就能像用游標一樣往前掃過整塊記憶體，
+// 不再需要自己手動維護 offset 變數、也不用每次都重新計算
+// data.data() + offset。
+// ------------------------------------------------------------
 template <typename uint_type>
-uint_type peek_uint(const uint8_t *ptr, ENDIAN endian = ENDIAN::BIG) {
-  const uint8_t *tmp = ptr;
-  return ptr_to_uint<uint_type>(tmp, endian);
+uint_type ptr_to_uint(const uint8_t *&ptr, ENDIAN endian = ENDIAN::BIG) {
+  uint_type tp = peek_uint<uint_type>(ptr, endian);
+  ptr += sizeof(uint_type); // 讀取完自動前進，模擬「游標」的行為
+  return tp;
 }
 
 const size_t CHUNK_HEADER_SIZE = 8;
@@ -326,7 +327,7 @@ struct UTF_Info {
   uint32_t table_name_offset;
   uint16_t row_count;
   uint16_t row_size_in_data2;
-  uint32_t total_cals;
+  uint32_t cal_count;
 
   // 如果有offset 請先把offset弄好
   UTF_Info(const std::vector<char> &data) {
@@ -344,7 +345,7 @@ struct UTF_Info {
     table_name_offset = ptr_to_uint<uint32_t>(ptr);
     row_count = ptr_to_uint<uint16_t>(ptr);
     row_size_in_data2 = ptr_to_uint<uint16_t>(ptr);
-    total_cals = ptr_to_uint<uint32_t>(ptr);
+    cal_count = ptr_to_uint<uint32_t>(ptr);
   }
 };
 
@@ -492,7 +493,7 @@ std::string char_to_string(const uint8_t *ptr, const uint8_t *buffer_end) {
   const uint8_t *p = ptr;
   while (p < buffer_end && *p != '\0')
     ++p;
-  return std::string(ptr, p) + "\"";
+  return std::string(ptr, p);
 }
 
 // 嘗試在指定的位移解析一個 Chunk
@@ -559,17 +560,17 @@ bool getOutput_payload_data_for_ivf(ChunkPayload &payload,
 
     IVF_Info ivf(payload.data, 0);
 
-    output << "      Magic ID：" << std::string(ivf.magic, 4) << "\n";
-    output << "      version：" << ivf.version << "\n";
+    output << "      Magic ID：" << std::string(ivf.magic, 4) << '\n';
+    output << "      version：" << ivf.version << '\n';
     output << "      IVF header 偏移：0\n";
     output << "      IVF header 大小：" << ivf.header_length << " bytes\n";
-    output << "      Codec：" << std::string(ivf.codec, 4) << "\n";
+    output << "      Codec：" << std::string(ivf.codec, 4) << '\n';
     output << "      解析度 (width x height)：" << ivf.width << " x "
-           << ivf.height << "\n";
+           << ivf.height << '\n';
     output << "      幀率 / 時間基：" << ivf.frame_rate << " / " << ivf.time
-           << "\n";
-    output << "      宣告總幀數：" << ivf.frames_number << "\n";
-    output << "      未使用欄位：" << ivf.unused << "\n";
+           << '\n';
+    output << "      宣告總幀數：" << ivf.frames_number << '\n';
+    output << "      未使用欄位：" << ivf.unused << '\n';
 
     if (ivf.header_length == 0) {
       offset = 32;
@@ -618,25 +619,25 @@ bool getOutput_payload_data_for_ivf(ChunkPayload &payload,
     uint64_t packet_end = static_cast<uint64_t>(frame_data_offset) + frame_size;
 
     output << "      Frame packet #" << (frame_packet_index + 1) << "：\n";
-    output << "        Frame 標頭偏移 (於payload.data)：" << offset << "\n";
+    output << "        Frame 標頭偏移 (於payload.data)：" << offset << '\n';
     output << "        frame size：" << frame_size << " bytes\n";
-    output << "        timestamp：" << timestamp << "\n";
-    output << "        實際資料偏移：" << frame_data_offset << "\n";
+    output << "        timestamp：" << timestamp << '\n';
+    output << "        實際資料偏移：" << frame_data_offset << '\n';
 
     if (packet_end > payload.data.size()) {
       output << "        錯誤：frame size 超出 payload.data 剩餘範圍。\n";
-      output << "        目前偏移：" << offset << "\n";
-      output << "        frame_data_offset：" << frame_data_offset << "\n";
-      output << "        frame_size：" << frame_size << "\n";
-      output << "        payload.data.size()：" << payload.data.size() << "\n";
+      output << "        目前偏移：" << offset << '\n';
+      output << "        frame_data_offset：" << frame_data_offset << '\n';
+      output << "        frame_size：" << frame_size << '\n';
+      output << "        payload.data.size()：" << payload.data.size() << '\n';
       return false;
     }
 
     const uint8_t *preview_ptr =
         reinterpret_cast<const uint8_t *>(payload.data.data()) +
         frame_data_offset;
-    bool enc = payload.data.size() <= 0x40 || payload.data.size() < 0x240;
-    output << "        資料解析" << (enc ? "(未加密)" : "(有加密)") << "：\n";
+    bool enc = payload.data.size() >= 0x240;
+    output << "        資料解析" << (enc ? "(有加密)" : "(未加密)") << "：\n";
     const uint8_t *end_ptr = nullptr;
     if (enc) {
       end_ptr = preview_ptr + 0x40;
@@ -649,7 +650,7 @@ bool getOutput_payload_data_for_ivf(ChunkPayload &payload,
     if (context.uncompressed_ok) {
       parse_vp9_compressed_header(context, end_ptr, output);
     }
-    output << std::dec << "\n";
+    output << std::dec << '\n';
 
     offset = static_cast<size_t>(packet_end);
     ++frame_packet_index;
@@ -696,20 +697,20 @@ bool getOutput_payload_data_for1(ChunkPayload &payload, std::ostream &output) {
       "每行欄位數：",
       "每行於資料II區大小 (bytes)：",
       "總行數："};
-  output << tab << utf_field_labels[0] << std::string(utf.magic, 4) << "\n";
-  output << tab << utf_field_labels[1] << utf.payload_size << "\n";
-  output << tab << utf_field_labels[2] << utf.data2_offset << "\n";
-  output << tab << utf_field_labels[3] << utf.str_stream_offset << "\n";
-  output << tab << utf_field_labels[4] << utf.byte_stream_offset << "\n";
-  output << tab << utf_field_labels[5] << utf.table_name_offset << "\n";
-  output << tab << utf_field_labels[6] << utf.row_count << "\n";
-  output << tab << utf_field_labels[7] << utf.row_size_in_data2 << "\n";
-  output << tab << utf_field_labels[8] << utf.total_cals << "\n";
+  output << tab << utf_field_labels[0] << std::string(utf.magic, 4) << '\n';
+  output << tab << utf_field_labels[1] << utf.payload_size << '\n';
+  output << tab << utf_field_labels[2] << utf.data2_offset << '\n';
+  output << tab << utf_field_labels[3] << utf.str_stream_offset << '\n';
+  output << tab << utf_field_labels[4] << utf.byte_stream_offset << '\n';
+  output << tab << utf_field_labels[5] << utf.table_name_offset << '\n';
+  output << tab << utf_field_labels[6] << utf.row_count << '\n';
+  output << tab << utf_field_labels[7] << utf.row_size_in_data2 << '\n';
+  output << tab << utf_field_labels[8] << utf.cal_count << '\n';
 
   output << tab << "表格名稱："
          << char_to_string(data,
                            8 + utf.str_stream_offset + utf.table_name_offset)
-         << "\n";
+         << '\n';
   tab += "  ";
 
   // Data I 區的欄位描述表，每個描述固定 5 bytes (1 byte flag + 4 byte
@@ -743,65 +744,99 @@ bool getOutput_payload_data_for1(ChunkPayload &payload, std::ostream &output) {
     std::string field_name =
         char_to_string(data, 8 + utf.str_stream_offset + utf_data.name_offset);
     std::string field_data = "unknown";
+
+    output << tab << "欄位名 '" << field_name << "'  型別："
+           << dataTypeToString(utf_data.data_type) << "  使用資料II："
+           << (utf_data.use_dataII ? "是" : "否") << "  資料大小："
+           << utf_data.used_bytes << " bytes, 內容：";
     {
       bool u = true;
       const uint8_t *&ptr = utf_data.use_dataII ? dataII_ptr : field_ptr;
       switch (utf_data.data_type) {
       case UTF_DATA_TYPE::CHAR:
         u = false;
+        [[fallthrough]];
       case UTF_DATA_TYPE::UCHAR: {
-        unsigned char orig = ptr_to_uint<unsigned char>(ptr);
-        field_data = std::to_string(u ? orig : static_cast<char>(orig));
+        for (size_t i = 0; i < utf.cal_count; i++) {
+          unsigned char orig = peek_uint<unsigned char>(
+              utf_data.use_dataII ? ptr + i * utf.row_size_in_data2 : ptr);
+          output << ' ' << (u ? orig : static_cast<char>(orig));
+        }
+        ptr += sizeof(char);
         break;
       }
       case UTF_DATA_TYPE::SHORT:
         u = false;
+        [[fallthrough]];
       case UTF_DATA_TYPE::USHORT: {
-        unsigned short orig = ptr_to_uint<unsigned short>(ptr);
-        field_data = std::to_string(u ? orig : static_cast<short>(orig));
+        for (size_t i = 0; i < utf.cal_count; i++) {
+          unsigned short orig = peek_uint<unsigned short>(
+              utf_data.use_dataII ? ptr + i * utf.row_size_in_data2 : ptr);
+          output << ' ' << (u ? orig : static_cast<short>(orig));
+        }
+        ptr += sizeof(short);
         break;
       }
       case UTF_DATA_TYPE::INT:
         u = false;
+        [[fallthrough]];
       case UTF_DATA_TYPE::UINT: {
-        unsigned int orig = ptr_to_uint<unsigned int>(ptr);
-        field_data = std::to_string(u ? orig : static_cast<int>(orig));
+        for (size_t i = 0; i < utf.cal_count; i++) {
+          unsigned int orig = peek_uint<unsigned int>(
+              utf_data.use_dataII ? ptr + i * utf.row_size_in_data2 : ptr);
+          output << ' ' << (u ? orig : static_cast<int>(orig));
+        }
+        ptr += sizeof(int);
         break;
       }
       case UTF_DATA_TYPE::LONG:
         u = false;
+        [[fallthrough]];
       case UTF_DATA_TYPE::ULONG: {
-        unsigned long long orig = ptr_to_uint<unsigned long long>(ptr);
-        field_data = std::to_string(u ? orig : static_cast<long long>(orig));
+        for (size_t i = 0; i < utf.cal_count; i++) {
+          unsigned long long orig = peek_uint<unsigned long long>(
+              utf_data.use_dataII ? ptr + i * utf.row_size_in_data2 : ptr);
+          output << ' ' << (u ? orig : static_cast<long long>(orig));
+        }
+        ptr += sizeof(long long);
         break;
       }
       case UTF_DATA_TYPE::FLOAT: {
-        float f = 0;
-        std::memcpy(&f, ptr, 4);
-        field_data = std::to_string(f);
+        for (size_t i = 0; i < utf.cal_count; i++) {
+          float f = std::numeric_limits<float>::quiet_NaN();
+          std::memcpy(
+              &f, utf_data.use_dataII ? ptr + i * utf.row_size_in_data2 : ptr,
+              4);
+          output << ' ' << (f);
+        }
         ptr += 4;
         break;
       }
       case UTF_DATA_TYPE::DOUBLE: {
-        double d = 0;
-        std::memcpy(&d, ptr, 8);
-        field_data = std::to_string(d);
+        for (size_t i = 0; i < utf.cal_count; i++) {
+          double d = std::numeric_limits<double>::quiet_NaN();
+          std::memcpy(
+              &d, utf_data.use_dataII ? ptr + i * utf.row_size_in_data2 : ptr,
+              8);
+          output << ' ' << (d);
+        }
         ptr += 8;
         break;
       }
       case UTF_DATA_TYPE::STRING: {
-        uint32_t offset = ptr_to_uint<uint32_t>(ptr);
-        field_data = char_to_string(str_stream_ptr + offset, data_end);
+        for (size_t i = 0; i < utf.cal_count; i++) {
+          uint32_t offset = peek_uint<uint32_t>(
+              utf_data.use_dataII ? ptr + i * utf.row_size_in_data2 : ptr);
+          output << ' ' << char_to_string(str_stream_ptr + offset, data_end);
+        }
+        ptr += 4;
         break;
       }
       case UTF_DATA_TYPE::BYTE:
         break;
       }
     }
-    output << tab << "欄位名 '" << field_name << "'  型別："
-           << dataTypeToString(utf_data.data_type) << "  使用資料II："
-           << (utf_data.use_dataII ? "是" : "否") << "  資料大小："
-           << utf_data.used_bytes << " bytes, 內容：" << field_data << "\n";
+    output << '\n';
   }
   return true;
 }
@@ -823,16 +858,16 @@ bool getOutput_payload_data_general(size_t length, ChunkPayload &payload,
       isprint(ptr[k]) ? output << static_cast<char>(ptr[k])
                       : output << "."; // 非可列印字元用 . 表示
     }
-    output << "\n";
+    output << '\n';
   } else { // 其他 stream 數據
     output << "    ";
     for (size_t k = 0; k < display_length; ++k) {
       output << std::hex << std::setw(2) << std::setfill('0')
-             << static_cast<unsigned int>(ptr[k]) << " ";
+             << static_cast<unsigned int>(ptr[k]) << ' ';
       if ((k + 1) % 16 == 0 && k + 1 < display_length)
         output << std::endl << "    "; // 每16字節換行
     }
-    output << std::dec << "\n";
+    output << std::dec << '\n';
   }
   return true;
 }
@@ -857,8 +892,7 @@ std::vector<ChunkInfo> parse_chunks(const std::string &filepath,
   }
   if (total_file_size_ss < 8) { // 檔案甚至不夠一個 chunk 的 header
     error << "警告：檔案過小 (" << total_file_size_ss
-          << " bytes)，不足以包含一個完整的 Chunk Header (8 bytes)。"
-          << "\n";
+          << " bytes)，不足以包含一個完整的 Chunk Header (8 bytes)。" << '\n';
     return {};
   }
   // 檔案大小
@@ -924,7 +958,7 @@ void getOutput_Chunks(std::string filepath, std::ostream &output, int length,
     output << std::dec << "--- Chunk #"
            << std::setw(std::to_string(chunks.size()).length())
            << std::setfill('0') << (i + 1) << " ---\n";
-    output << "  Chunk 類型 (Magic)：" << std::string(chunk.magic, 4) << "\n";
+    output << "  Chunk 類型 (Magic)：" << std::string(chunk.magic, 4) << '\n';
     output << "  Payload 資訊：\n";
     output << "    原始類型ID：" << static_cast<int>(payload.type_raw) << " ("
            << (KNOWN_PAYLOAD_TYPES.count(payload.type_raw)
@@ -935,11 +969,10 @@ void getOutput_Chunks(std::string filepath, std::ostream &output, int length,
            << ")\n";
     output << "    內容數據偏移 (於Payload內)："
            << static_cast<int>(payload.data_offset) << " bytes\n";
-    output << "    區塊結尾填充大小：" << payload.padding << " bytes"
-           << "\n";
-    output << "    通道號：" << static_cast<int>(payload.channel) << "\n";
-    output << "    幀時間/計數：" << payload.frame_time << "\n";
-    output << "    幀率：" << payload.frame_rate << "\n";
+    output << "    區塊結尾填充大小：" << payload.padding << " bytes" << '\n';
+    output << "    通道號：" << static_cast<int>(payload.channel) << '\n';
+    output << "    幀時間/計數：" << payload.frame_time << '\n';
+    output << "    幀率：" << payload.frame_rate << '\n';
 
     if ((payload.type_raw == 0x01 || payload.type_raw == 0x03)) {
       getOutput_payload_data_for1(payload, output);
@@ -949,7 +982,7 @@ void getOutput_Chunks(std::string filepath, std::ostream &output, int length,
       getOutput_payload_data_general(static_cast<size_t>(length), payload,
                                      output);
     }
-    output << "--- End of Chunk #" << (i + 1) << " ---" << std::endl << "\n";
+    output << "--- End of Chunk #" << (i + 1) << " ---" << std::endl << '\n';
   }
   output << "已到達要求輸出之上限：" << start_chunk << " ~ " << end_chunk
          << " (此檔案共 " << chunks.size() << " 筆資料)\n";
@@ -1016,6 +1049,7 @@ int main(int argc, char *argv[]) {
 #ifdef _WIN32
   SetConsoleOutputCP(CP_UTF8);
 #endif
+  std::ios::sync_with_stdio(false);
 
   // 一開始就先提醒使用者：這支程式大量使用指標直接讀取二進位資料，
   // 若輸入的 .usm 檔案本身已損壞或格式不符，很可能造成越界讀取等
@@ -1050,7 +1084,7 @@ int main(int argc, char *argv[]) {
       has_key = true;
     } catch (const std::exception &e) {
       std::cerr << "錯誤：key1/key2 必須是16進位數字（可加或不加 0x 前綴）："
-                << e.what() << "\n";
+                << e.what() << '\n';
       return 1;
     }
   } else {
@@ -1072,7 +1106,7 @@ int main(int argc, char *argv[]) {
     }
     return 1;
   }
-  std::cout << "分析結果正在寫入檔案: " << output_file_path << "\n";
+  std::cout << "分析結果正在寫入檔案: " << output_file_path << '\n';
   if (!usm_file_path.empty()) {
     getOutput_Chunks(usm_file_path, log_file, 256, 0, 120);
   }
@@ -1090,12 +1124,12 @@ int main(int argc, char *argv[]) {
         outputFile_IVF(usm_file_path, log_file, ivf_file);
       }
       ivf_file.close();
-      std::cout << "IVF 已輸出到: " << ivf_file_path << "\n";
+      std::cout << "IVF 已輸出到: " << ivf_file_path << '\n';
     }
   }
 
   log_file.close();
-  std::cout << "分析完成，結果已保存到: " << output_file_path << "\n";
+  std::cout << "分析完成，結果已保存到: " << output_file_path << '\n';
 
   return 0;
 }

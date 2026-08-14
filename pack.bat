@@ -1,1 +1,1 @@
-g++ -std=c++20 usm.cpp -o usm.exe
+g++ -std=c++20 -Wall -Wextra -O2 usm.cpp vp9_header_parser.cpp -o usm.exe
