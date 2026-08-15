@@ -6,7 +6,6 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
-#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -15,37 +14,31 @@
 #include <windows.h>
 #endif
 
-#include "vp9_header_parser_silent.h"
-
 // ------------------------------------------------------------
 // 位元組端序定義與基礎讀取工具
 // ------------------------------------------------------------
 enum class ENDIAN { BIG, LITTLE };
 
 template <typename uint_type>
-uint_type peek_uint(const uint8_t *ptr, ENDIAN endian = ENDIAN::BIG) {
-  static_assert(std::is_unsigned<uint_type>::value, "只允許 unsigned 數字類別");
+inline uint_type peek_uint(const uint8_t *ptr, ENDIAN endian = ENDIAN::BIG) {
+  static_assert(std::is_unsigned_v<uint_type>, "只允許 unsigned 數字類別");
   constexpr size_t byteCount = sizeof(uint_type);
-
   uint_type result = 0;
   if (endian == ENDIAN::BIG) {
     for (size_t i = 0; i < byteCount; ++i) {
-      result <<= 8;
-      result |= static_cast<uint_type>(ptr[i]);
-    }
-  } else if (endian == ENDIAN::LITTLE) {
-    for (size_t i = 0; i < byteCount; ++i) {
-      result |= static_cast<uint_type>(ptr[i]) << (8 * i);
+      result = static_cast<uint_type>((result << 8) | ptr[i]);
     }
   } else {
-    throw std::logic_error("未知的 endian 類別");
+    for (size_t i = 0; i < byteCount; ++i) {
+      result = static_cast<uint_type>(
+          result | (static_cast<uint_type>(ptr[i]) << (8 * i)));
+    }
   }
-
   return result;
 }
 
 template <typename uint_type>
-uint_type ptr_to_uint(const uint8_t *&ptr, ENDIAN endian = ENDIAN::BIG) {
+inline uint_type ptr_to_uint(const uint8_t *&ptr, ENDIAN endian = ENDIAN::BIG) {
   uint_type tp = peek_uint<uint_type>(ptr, endian);
   ptr += sizeof(uint_type);
   return tp;
@@ -140,21 +133,17 @@ UsmKeys generate_usm_keys(uint64_t key_num) {
   return generate_usm_keys(key1, key2);
 }
 
-void decrypt_video_packet(std::vector<char> &packet,
+void decrypt_video_packet(uint8_t *data, size_t size,
                           const std::array<uint8_t, 0x40> &video_key) {
-  if (packet.size() < 0x40)
-    return;
-  size_t size = packet.size() - 0x40;
-  if (size < 0x200)
+  if (size < 0x240)
     return;
 
-  uint8_t *data = reinterpret_cast<uint8_t *>(packet.data());
   const uint8_t *vm1 = video_key.data();
   const uint8_t *vm2 = video_key.data() + 0x20;
 
   // 階段 1：從 offset 0x140 開始 (即 payload + 0x40 + 0x100)
-  size_t first_start = 0x40 + 0x100;
-  size_t first_size = size - 0x100;
+  size_t first_start = 0x140;
+  size_t first_size = size - 0x140;
   size_t full_blocks = first_size / 0x20;
   size_t tail_size = first_size & 0x1F;
 
@@ -192,351 +181,149 @@ void decrypt_video_packet(std::vector<char> &packet,
 }
 
 // ============================================================
-// 第一層：Chunk 結構體與說明
+// 第一層：Chunk 結構體 (合併標頭與必要欄位)
 // ============================================================
 
-// USM 底層原始 Chunk 結構
-struct ChunkHeader {
-  char magic[4];         // Chunk 識別 Magic
-  uint32_t payload_size; // Payload 資料大端序長度 (bytes)
-  std::vector<char>
-      payload_data; // Payload 原始資料 (包含 ChunkPayload 標頭與內文)
+struct Chunk {
+  char magic[4] = {0};       // Chunk 識別 Magic (例如 "@SFV", "#SFV")
+  uint32_t payload_size = 0; // Payload 資料大端序長度 (bytes)
+  uint8_t data_offset = 0;   // offset 1: 實際內容資料偏移 (通常為 0x18 = 24)
+  uint16_t padding = 0;      // offset 2~3: 區塊結尾填充大小 (bytes)
+  uint8_t type_raw = 0;      // offset 7: 原始 Payload 種類 (0: stream 影音)
+  std::vector<char> payload_data; // Payload 完整原始資料
 };
 
-// Chunk Payload 內部標頭解析結構
-struct ChunkPayload {
-  uint8_t unknown_1;   // offset 0: 未知位元組 1
-  uint8_t data_offset; // offset 1: 實際內容資料偏移 (自 Chunk 標頭起算)
-  uint16_t padding;    // offset 2~3: 區塊結尾填充大小 (bytes)
-  uint8_t channel;     // offset 4: 通道編號
-  uint16_t unknown_2;  // offset 5~6: 未知位元組 2
-  uint8_t type_raw;    // offset 7: 原始 Payload 種類 (0: stream 影音, 1: header
-                       // 檔頭, 2: section_end, 3: seek)
-  uint32_t frame_time; // offset 8~11: 幀時間 / 幀計數
-  uint32_t frame_rate; // offset 12~15: 幀率 (Frame Rate)
-  uint64_t unknown_3;  // offset 16~23: 未知位元組 3
+// ------------------------------------------------------------
+// 串流讀取器 (Stream Reader / Iterator)
+// ------------------------------------------------------------
+class UsmReader {
+private:
+  std::string filepath_;
+  std::ifstream file_;
+  std::streamoff total_size_ = 0;
 
-  std::vector<char>
-      data; // offset 24+: 扣除標頭與尾部 Padding 後的實際 Payload 數據
-
-  ChunkPayload() = default;
-  ChunkPayload(const std::vector<char> &chrs) {
-    if (chrs.size() < 25)
-      throw std::out_of_range("解析 Payload 時傳入的 vector 過小。");
-
-    const uint8_t *ptr = reinterpret_cast<const uint8_t *>(chrs.data());
-
-    unknown_1 = *ptr;
-    ++ptr;
-    data_offset = *ptr;
-    ++ptr;
-    padding = ptr_to_uint<uint16_t>(ptr);
-    channel = *ptr;
-    ++ptr;
-    unknown_2 = ptr_to_uint<uint16_t>(ptr);
-    type_raw = *ptr;
-    ++ptr;
-    frame_time = ptr_to_uint<uint32_t>(ptr);
-    frame_rate = ptr_to_uint<uint32_t>(ptr);
-    unknown_3 = ptr_to_uint<uint64_t>(ptr);
-
-    if (static_cast<size_t>(padding) > chrs.size() - 24)
-      throw std::out_of_range("解析 Payload 時 padding 大於剩餘資料長度。");
-
-    data = std::vector<char>(chrs.begin() + 24, chrs.end() - padding);
-  }
-};
-
-// ============================================================
-// 第二層：IVF 結構體與說明
-// ============================================================
-
-// IVF 檔案標頭結構 (DKIF, 32 bytes)
-struct IVF_Header {
-  char magic[4];          // bytes 0-3: 簽章識別碼 (例如 'DKIF')
-  uint16_t version;       // bytes 4-5: IVF 規格版本 (應為 0)
-  uint16_t header_length; // bytes 6-7: IVF 檔頭大小 (bytes, 通常為 32)
-  char codec[4];          // bytes 8-11: 編碼器 FourCC (例如 'VP90', 'VP80')
-  uint16_t width;         // bytes 12-13: 畫面像素寬度
-  uint16_t height;        // bytes 14-15: 畫面像素高度
-  uint32_t frame_rate;    // bytes 16-19: 幀率 / 時間分母
-  uint32_t time;          // bytes 20-23: 時間基數 / 時間分子
-  uint32_t frames_number; // bytes 24-27: 宣告總幀數
-  uint32_t unused;        // bytes 28-31: 未使用 / 保留欄位
-
-  IVF_Header() = default;
-  IVF_Header(const std::vector<char> &data, size_t offset = 0) {
-    if (data.size() < offset + 32) {
-      throw std::out_of_range("IVF Header 資料長度不足 32 bytes");
+public:
+  explicit UsmReader(const std::string &filepath)
+      : filepath_(filepath), file_(filepath, std::ios::binary) {
+    if (file_.is_open()) {
+      file_.seekg(0, std::ios::end);
+      total_size_ = file_.tellg();
+      file_.seekg(0, std::ios::beg);
     }
-    const uint8_t *ptr =
-        reinterpret_cast<const uint8_t *>(data.data()) + offset;
-
-    std::memcpy(magic, ptr, 4);
-    ptr += 4;
-    version = ptr_to_uint<uint16_t>(ptr, ENDIAN::LITTLE);
-    header_length = ptr_to_uint<uint16_t>(ptr, ENDIAN::LITTLE);
-    std::memcpy(codec, ptr, 4);
-    ptr += 4;
-    width = ptr_to_uint<uint16_t>(ptr, ENDIAN::LITTLE);
-    height = ptr_to_uint<uint16_t>(ptr, ENDIAN::LITTLE);
-    frame_rate = ptr_to_uint<uint32_t>(ptr, ENDIAN::LITTLE);
-    time = ptr_to_uint<uint32_t>(ptr, ENDIAN::LITTLE);
-    frames_number = ptr_to_uint<uint32_t>(ptr, ENDIAN::LITTLE);
-    unused = ptr_to_uint<uint32_t>(ptr, ENDIAN::LITTLE);
   }
-};
 
-// 單一 IVF 幀封包結構
-struct IVF_frame_data {
-  uint32_t size;          // bytes 0~3: Frame 數據長度 (bytes)
-  uint64_t timestamp;     // bytes 4~11: 時間戳記 (64-bit integer)
-  std::vector<char> data; // Frame 實際 VP9 Bitstream 數據
+  bool is_open() const { return file_.is_open() && total_size_ >= 8; }
+  uint64_t total_size() const {
+    return total_size_ > 0 ? static_cast<uint64_t>(total_size_) : 0;
+  }
 
-  IVF_frame_data() = default;
-  IVF_frame_data(const std::vector<char> &raw_payload, size_t offset) {
-    if (raw_payload.size() < offset + 12) {
-      throw std::out_of_range("IVF Frame Header 資料長度不足 12 bytes");
+  void rewind() {
+    if (file_.is_open()) {
+      file_.clear();
+      file_.seekg(0, std::ios::beg);
     }
-    const uint8_t *ptr =
-        reinterpret_cast<const uint8_t *>(raw_payload.data()) + offset;
-
-    size = ptr_to_uint<uint32_t>(ptr, ENDIAN::LITTLE);
-    timestamp = ptr_to_uint<uint64_t>(ptr, ENDIAN::LITTLE);
-
-    if (raw_payload.size() < offset + 12 + size) {
-      throw std::out_of_range("IVF Frame 聲明之資料長度超出 payload 範圍");
-    }
-    data.assign(reinterpret_cast<const char *>(ptr),
-                reinterpret_cast<const char *>(ptr) + size);
-  }
-};
-
-// 完整 IVF 串流容器
-struct IVF_Stream {
-  bool has_header = false;            // 是否有包含 DKIF 檔頭
-  IVF_Header header;                  // IVF 檔頭資訊
-  std::vector<IVF_frame_data> frames; // 依序排列的所有 IVF Frame Packets 列表
-};
-
-// ============================================================
-// 第三層：VP9 結構體與說明
-// ============================================================
-
-// VP9 單一 Frame 語法結構解析結果
-struct VP9ParsedFrame {
-  size_t frame_index;  // Frame 序號 (1-based)
-  uint32_t frame_size; // Frame 數據大小 (bytes)
-  uint64_t timestamp;  // Frame 時間戳記
-  bool is_encrypted;   // 是否採 CRI 滾動加密 (payload 剩餘長度 >= 0x240)
-  VP9FrameContext
-      context; // VP9 Frame 標頭 Context 結構 (定義於 vp9_header_parser.h)
-};
-
-// ------------------------------------------------------------
-// 單一 Chunk 解析 (無控制台輸出)
-// ------------------------------------------------------------
-bool parse_one_chunk(std::ifstream &ifs, size_t chunk_offset,
-                     ChunkHeader &chunk) {
-  auto read_bytes = [&](std::streamoff offset, char *buffer,
-                        std::streamsize size) -> bool {
-    ifs.seekg(offset);
-    return static_cast<bool>(ifs.read(buffer, size));
-  };
-
-  char magic_temp[4] = {0};
-  if (!read_bytes(chunk_offset, magic_temp, 4))
-    return false;
-  std::memcpy(chunk.magic, magic_temp, 4);
-
-  char payload_size_temp[4];
-  if (!read_bytes(chunk_offset + 4, payload_size_temp, 4))
-    return false;
-
-  const uint8_t *size_ptr =
-      reinterpret_cast<const uint8_t *>(payload_size_temp);
-  chunk.payload_size = ptr_to_uint<uint32_t>(size_ptr, ENDIAN::BIG);
-
-  chunk.payload_data.resize(chunk.payload_size);
-  if (!read_bytes(chunk_offset + 8, chunk.payload_data.data(),
-                  chunk.payload_size))
-    return false;
-
-  return true;
-}
-
-// ------------------------------------------------------------
-// 三大層級解析函式實作
-// ------------------------------------------------------------
-
-std::vector<ChunkHeader> parse_usm_chunks(const std::string &filepath) {
-  std::ifstream file(filepath, std::ios::binary | std::ios::ate);
-  if (!file.is_open())
-    return {};
-
-  std::streamsize total_file_size_ss = file.tellg();
-  if (total_file_size_ss <= 0 || total_file_size_ss < 8) {
-    file.close();
-    return {};
-  }
-  uint64_t total_file_size = static_cast<uint64_t>(total_file_size_ss);
-
-  std::vector<ChunkHeader> chunks;
-  uint64_t current_offset = 0;
-
-  while (current_offset < total_file_size) {
-    if (current_offset + CHUNK_HEADER_SIZE >= total_file_size)
-      break;
-    ChunkHeader chunk;
-    if (!parse_one_chunk(file, current_offset, chunk))
-      break;
-
-    chunks.push_back(chunk);
-    current_offset += chunk.payload_size + CHUNK_HEADER_SIZE;
-    if (current_offset > total_file_size)
-      break;
   }
 
-  file.close();
-  return chunks;
-}
+  // 串流讀取下一個 Chunk (複用 chunk 記憶體空間)
+  bool read_next(Chunk &chunk, bool read_payload = true) {
+    if (!file_.is_open())
+      return false;
 
-// ------------------------------------------------------------
-// [函式 二]：解析第二層 - 解出 IVF 檔頭與所有 Frame Packets 列表
-// (可選傳入金鑰自動完成視訊解密)
-// ------------------------------------------------------------
-IVF_Stream parse_ivf_stream(const std::vector<ChunkHeader> &chunks,
-                            bool decrypt = false,
-                            const UsmKeys *keys = nullptr) {
-  IVF_Stream ivf_stream;
-
-  for (const auto &chunk : chunks) {
-    ChunkPayload payload(chunk.payload_data);
-    if (payload.type_raw != 0)
-      continue; // 僅讀取 stream (影音) 類型的 payload
-
-    std::vector<char> stream_data = payload.data;
-    if (decrypt && keys != nullptr) {
-      decrypt_video_packet(stream_data, keys->video_key);
+    std::streamoff cur = file_.tellg();
+    if (cur < 0 ||
+        cur + static_cast<std::streamoff>(CHUNK_HEADER_SIZE) > total_size_) {
+      return false;
     }
 
-    size_t offset = 0;
+    char header[8];
+    if (!file_.read(header, 8)) {
+      return false;
+    }
 
-    // 首個包含 DKIF 檔頭的區塊
-    if (!ivf_stream.has_header) {
-      if (stream_data.size() >= 32 &&
-          std::memcmp(stream_data.data(), "DKIF", 4) == 0) {
-        ivf_stream.header = IVF_Header(stream_data, 0);
-        ivf_stream.has_header = true;
-        offset = (ivf_stream.header.header_length == 0)
-                     ? 32
-                     : ivf_stream.header.header_length;
-      } else {
-        continue; // 尚未遇到檔頭前的數據跳過
+    std::memcpy(chunk.magic, header, 4);
+    const uint8_t *size_ptr = reinterpret_cast<const uint8_t *>(header + 4);
+    chunk.payload_size = ptr_to_uint<uint32_t>(size_ptr, ENDIAN::BIG);
+
+    if (static_cast<uint64_t>(file_.tellg()) + chunk.payload_size >
+        static_cast<uint64_t>(total_size_)) {
+      return false;
+    }
+
+    if (!read_payload) {
+      file_.seekg(chunk.payload_size, std::ios::cur);
+      chunk.data_offset = 0;
+      chunk.padding = 0;
+      chunk.type_raw = 0xFF;
+      chunk.payload_data.clear();
+      return true;
+    }
+
+    chunk.payload_data.resize(chunk.payload_size);
+    if (chunk.payload_size > 0) {
+      if (!file_.read(chunk.payload_data.data(), chunk.payload_size)) {
+        return false;
       }
+    }
+
+    // 快速擷取 Payload 標頭關鍵欄位 (至少需 24 bytes)
+    if (chunk.payload_size >= 24) {
+      const uint8_t *ptr =
+          reinterpret_cast<const uint8_t *>(chunk.payload_data.data());
+      chunk.data_offset = ptr[1];
+      chunk.padding = peek_uint<uint16_t>(ptr + 2, ENDIAN::BIG);
+      chunk.type_raw = ptr[7];
     } else {
-      // 若後續 chunk 又重複帶 DKIF 標頭，跳過標頭 offset
-      if (stream_data.size() >= 32 &&
-          std::memcmp(stream_data.data(), "DKIF", 4) == 0) {
-        offset = 32;
-      }
+      chunk.data_offset = 0;
+      chunk.padding = 0;
+      chunk.type_raw = 0xFF;
     }
 
-    // 連續解出該 Payload 內包含的所有 IVF Frame Packets
-    while (offset + 12 <= stream_data.size()) {
-      try {
-        IVF_frame_data frame(stream_data, offset);
-        uint64_t next_offset = offset + 12 + frame.size;
-        if (next_offset > stream_data.size())
-          break;
-
-        ivf_stream.frames.push_back(std::move(frame));
-        offset = static_cast<size_t>(next_offset);
-      } catch (const std::exception &) {
-        break;
-      }
-    }
+    return true;
   }
-
-  return ivf_stream;
-}
+};
 
 // ------------------------------------------------------------
-// [函式 三]：解析第三層 - 解出 VP9 Frame Header 結構列表
+// 輔助函式：解密視訊 Chunk 並串流匯出還原檔案 (Zero-Copy 原處解密)
 // ------------------------------------------------------------
-std::vector<VP9ParsedFrame> parse_vp9_frames(const IVF_Stream &ivf_stream) {
-  std::vector<VP9ParsedFrame> vp9_frames;
-
-  size_t idx = 1;
-  for (const auto &frame : ivf_stream.frames) {
-    VP9ParsedFrame vp9_frame;
-    vp9_frame.frame_index = idx++;
-    vp9_frame.frame_size = frame.size;
-    vp9_frame.timestamp = frame.timestamp;
-
-    const uint8_t *preview_ptr =
-        reinterpret_cast<const uint8_t *>(frame.data.data());
-    bool enc = frame.data.size() >= 0x240;
-    vp9_frame.is_encrypted = enc;
-
-    const uint8_t *end_ptr = nullptr;
-    if (enc && frame.data.size() >= 0x40) {
-      end_ptr = preview_ptr + 0x40;
-    } else {
-      end_ptr = preview_ptr + frame.data.size();
-    }
-
-    parse_vp9_uncompressed_header_silent(preview_ptr, end_ptr,
-                                         vp9_frame.context);
-    if (vp9_frame.context.uncompressed_ok) {
-      parse_vp9_compressed_header_silent(end_ptr, vp9_frame.context);
-    }
-
-    vp9_frames.push_back(vp9_frame);
-  }
-
-  return vp9_frames;
-}
-
-// ------------------------------------------------------------
-// 輔助函式：匯出 IVF 檔案
-// ------------------------------------------------------------
-bool export_ivf_file(const std::string &out_ivf_file,
-                     const IVF_Stream &ivf_stream) {
-  if (!ivf_stream.has_header || ivf_stream.frames.empty())
-    return false;
-
-  std::ofstream out(out_ivf_file, std::ios::binary);
+bool export_file(const std::string &out_file, UsmReader &reader,
+                 const UsmKeys &keys) {
+  reader.rewind();
+  std::ofstream out(out_file, std::ios::binary);
   if (!out.is_open())
     return false;
 
-  // 寫入 32-byte IVF Header
-  char header_bytes[32] = {0};
-  std::memcpy(header_bytes, "DKIF", 4);
-  *reinterpret_cast<uint16_t *>(header_bytes + 4) = ivf_stream.header.version;
-  *reinterpret_cast<uint16_t *>(header_bytes + 6) = 32; // header_length
-  std::memcpy(header_bytes + 8, ivf_stream.header.codec, 4);
-  *reinterpret_cast<uint16_t *>(header_bytes + 12) = ivf_stream.header.width;
-  *reinterpret_cast<uint16_t *>(header_bytes + 14) = ivf_stream.header.height;
-  *reinterpret_cast<uint32_t *>(header_bytes + 16) =
-      ivf_stream.header.frame_rate;
-  *reinterpret_cast<uint32_t *>(header_bytes + 20) = ivf_stream.header.time;
-  *reinterpret_cast<uint32_t *>(header_bytes + 24) =
-      static_cast<uint32_t>(ivf_stream.frames.size());
+  size_t written_chunks = 0;
+  Chunk chunk;
 
-  out.write(header_bytes, 32);
+  while (reader.read_next(chunk)) {
+    if (std::memcmp(chunk.magic, "@SFV", 4) != 0)
+      continue;
 
-  // 依序寫入 Frame Headers 與 Data
-  for (const auto &f : ivf_stream.frames) {
-    char frame_hdr[12];
-    *reinterpret_cast<uint32_t *>(frame_hdr) = f.size;
-    *reinterpret_cast<uint64_t *>(frame_hdr + 4) = f.timestamp;
-    out.write(frame_hdr, 12);
-    out.write(f.data.data(), f.size);
+    if (chunk.payload_data.size() < 24)
+      continue;
+
+    if (chunk.type_raw != 0)
+      continue; // 僅處理 stream 影音
+
+    if (chunk.payload_data.size() <
+        static_cast<size_t>(chunk.data_offset + chunk.padding))
+      continue;
+
+    size_t stream_size =
+        chunk.payload_data.size() - chunk.data_offset - chunk.padding;
+    uint8_t *stream_ptr = reinterpret_cast<uint8_t *>(
+        chunk.payload_data.data() + chunk.data_offset);
+
+    decrypt_video_packet(stream_ptr, stream_size, keys.video_key);
+
+    if (stream_size > 0) {
+      out.write(reinterpret_cast<const char *>(stream_ptr), stream_size);
+      written_chunks++;
+    }
   }
 
   out.close();
-  return true;
+  return (written_chunks > 0);
 }
 
 // ============================================================
@@ -548,8 +335,20 @@ struct Candidate {
   std::array<uint8_t, 32> v{};
 };
 
-using ScoreMatrixUnigram = std::vector<std::array<uint32_t, 256>>;
-using ScoreMatrixBigram = std::vector<std::vector<uint32_t>>;
+using ScoreMatrixUnigram = std::array<std::array<uint32_t, 256>, 32>;
+
+struct ScoreMatrixBigram {
+  std::vector<uint32_t> data;
+  ScoreMatrixBigram() : data(31 * 65536, 0) {}
+
+  inline uint32_t get(size_t index, uint32_t pair_val) const {
+    return data[index * 65536 + pair_val];
+  }
+
+  inline void add(size_t index, uint32_t pair_val) {
+    data[index * 65536 + pair_val]++;
+  }
+};
 
 static inline int64_t calculate_bg_score(const ScoreMatrixBigram &bigram,
                                          int index, uint8_t left, uint8_t right,
@@ -557,8 +356,8 @@ static inline int64_t calculate_bg_score(const ScoreMatrixBigram &bigram,
   uint32_t pair_ff = (static_cast<uint32_t>(left) << 8) | right;
   uint32_t pair_zero =
       (static_cast<uint32_t>(left ^ 0xFF) << 8) | (right ^ 0xFF);
-  return static_cast<int64_t>(ff_w) * bigram[index][pair_ff] +
-         static_cast<int64_t>(zero_w) * bigram[index][pair_zero];
+  return static_cast<int64_t>(ff_w) * bigram.get(index, pair_ff) +
+         static_cast<int64_t>(zero_w) * bigram.get(index, pair_zero);
 }
 
 static void prune_candidates(std::vector<Candidate> &candidates, size_t beam) {
@@ -761,169 +560,235 @@ static bool solve_vm1_bigram(const ScoreMatrixUnigram &unigram,
 }
 
 // ------------------------------------------------------------
-// 高階介面函式：執行 USM 金鑰破解與選擇性導出還原影片
+// 輔助函式：累加單一 Chunk 的統計頻率資訊
 // ------------------------------------------------------------
-bool crack_usm_key(const std::vector<ChunkHeader> &chunks, bool output_video,
-                   KeyResult &out_key,
-                   const std::string &out_ivf_file = "outputV.ivf",
-                   const IVF_Stream *preparsed_ivf = nullptr,
-                   const std::vector<VP9ParsedFrame> *preparsed_vp9 = nullptr) {
-  (void)preparsed_vp9; // 可用於擴充進階語法約束
+static void accumulate_chunk_statistics(
+    const Chunk &chunk, ScoreMatrixUnigram &unigram, ScoreMatrixBigram &bigram,
+    uint64_t &sample_rows, uint64_t &odd_bigram_zero, uint64_t &odd_bigram_ff) {
+  if (std::memcmp(chunk.magic, "@SFV", 4) != 0)
+    return;
 
-  ScoreMatrixUnigram unigram(32);
-  ScoreMatrixBigram bigram(31, std::vector<uint32_t>(65536, 0));
+  if (chunk.payload_data.size() < 24)
+    return;
 
-  for (size_t i = 0; i < 32; ++i) {
-    unigram[i].fill(0);
+  if (chunk.type_raw != 0) // 僅處理 stream 影音
+    return;
+
+  if (chunk.payload_data.size() <
+      static_cast<size_t>(chunk.data_offset + chunk.padding))
+    return;
+
+  size_t stream_size = chunk.payload_size - chunk.data_offset - chunk.padding;
+
+  // 檢查 stream 大小是否達到加密最小門檻 (扣除 0x40 後 >= 0x200)
+  if (stream_size < 0x240)
+    return;
+
+  size_t encrypted_size = stream_size - 0x140;
+  encrypted_size -= (encrypted_size % 32);
+  if (encrypted_size < 32)
+    return;
+
+  size_t start_in_payload_data = chunk.data_offset + 0x140;
+  const uint8_t *raw_ptr =
+      reinterpret_cast<const uint8_t *>(chunk.payload_data.data());
+  size_t num_blocks = encrypted_size / 32;
+
+  uint8_t current_s[32] = {0};
+
+  for (size_t b = 0; b < num_blocks; ++b) {
+    size_t block_start = start_in_payload_data + b * 32;
+    if (block_start + 32 > chunk.payload_data.size())
+      break;
+
+    for (size_t j = 0; j < 32; ++j) {
+      current_s[j] ^= raw_ptr[block_start + j];
+    }
+
+    if (b % 2 == 0) {
+      sample_rows++;
+      for (size_t j = 0; j < 32; ++j) {
+        unigram[j][current_s[j]]++;
+        unigram[j][current_s[j] ^ 0xFF]++;
+      }
+      for (size_t j = 0; j < 31; ++j) {
+        uint32_t pair_val =
+            (static_cast<uint32_t>(current_s[j]) << 8) | current_s[j + 1];
+        bigram.add(j, pair_val);
+      }
+    } else {
+      for (size_t j = 0; j < 31; ++j) {
+        uint8_t left = current_s[j];
+        uint8_t right = current_s[j + 1];
+        if (left == 0x00 && right == 0x00) {
+          odd_bigram_zero++;
+        } else if (left == 0xFF && right == 0xFF) {
+          odd_bigram_ff++;
+        }
+      }
+    }
   }
+}
+
+// ------------------------------------------------------------
+// 輔助函式：以第一包視訊資料驗證金鑰是否收斂 (DKIF 標頭匹配)
+// ------------------------------------------------------------
+static bool test_key_convergence(const std::vector<char> &first_video_packet,
+                                 uint32_t key1, uint32_t key2) {
+  if (first_video_packet.size() < 32)
+    return false;
+  std::vector<char> test_packet = first_video_packet;
+  UsmKeys test_keys = generate_usm_keys(key1, key2);
+  decrypt_video_packet(reinterpret_cast<uint8_t *>(test_packet.data()),
+                       test_packet.size(), test_keys.video_key);
+  return (std::memcmp(test_packet.data(), "DKIF", 4) == 0);
+}
+
+// ------------------------------------------------------------
+// 輔助函式：自 32-byte VM1 遮罩計算 KeyResult
+// ------------------------------------------------------------
+static KeyResult build_key_result(const std::array<uint8_t, 32> &vm1) {
+  uint8_t k1[4] = {vm1[0], vm1[1], vm1[2],
+                   static_cast<uint8_t>((vm1[3] + 0x34) & 0xFF)};
+  uint8_t k2[4] = {static_cast<uint8_t>((vm1[4] - 0xF9) & 0xFF),
+                   static_cast<uint8_t>(vm1[5] ^ 0x13),
+                   static_cast<uint8_t>((vm1[6] - 0x61) & 0xFF), 0x00};
+
+  KeyResult res;
+  res.key1 = (static_cast<uint32_t>(k1[0]) << 24) |
+             (static_cast<uint32_t>(k1[1]) << 16) |
+             (static_cast<uint32_t>(k1[2]) << 8) | static_cast<uint32_t>(k1[3]);
+
+  res.key2 = (static_cast<uint32_t>(k2[0]) << 24) |
+             (static_cast<uint32_t>(k2[1]) << 16) |
+             (static_cast<uint32_t>(k2[2]) << 8) | static_cast<uint32_t>(k2[3]);
+
+  res.key64 = 0;
+  for (int i = 0; i < 4; ++i) {
+    res.key64 |= (static_cast<uint64_t>(k1[i]) << (8 * i));
+  }
+  for (int i = 0; i < 4; ++i) {
+    res.key64 |= (static_cast<uint64_t>(k2[i]) << (8 * (4 + i)));
+  }
+  return res;
+}
+
+// ------------------------------------------------------------
+// 高階介面函式：執行 USM 串流金鑰破解 (動態批次收斂)
+// ------------------------------------------------------------
+bool crack_usm_key(UsmReader &reader, bool output_video, KeyResult &out_key,
+                   const std::string &out_ivf_file = "outputV.ivf") {
+
+  reader.rewind();
+
+  ScoreMatrixUnigram unigram{};
+  ScoreMatrixBigram bigram;
 
   uint64_t sample_rows = 0;
   uint64_t odd_bigram_zero = 0;
   uint64_t odd_bigram_ff = 0;
 
-  // 遍歷所有 Chunk 統計 @SFV 影片區塊
-  for (const auto &chunk : chunks) {
-    if (std::memcmp(chunk.magic, "@SFV", 4) != 0)
-      continue;
+  std::vector<char> first_video_packet;
+  size_t total_chunks_read = 0;
+  size_t batch_chunks_read = 0;
+  constexpr size_t BATCH_SIZE = 100;
+  bool converged = false;
 
-    if (chunk.payload_data.size() < 25)
-      continue;
+  auto calculate_weights = [&](int &zero_w, int &ff_w) {
+    zero_w = 10;
+    ff_w = 4;
+    uint64_t total_hits = odd_bigram_zero + odd_bigram_ff;
+    if (total_hits >= 100) {
+      double raw_ratio =
+          (odd_bigram_ff > 0)
+              ? (static_cast<double>(odd_bigram_zero) / odd_bigram_ff)
+              : 5.0;
+      double adjusted_ratio = std::clamp(raw_ratio, 1.0, 5.0);
+      zero_w = static_cast<int>(
+          std::round(25.0 * adjusted_ratio / (1.0 + adjusted_ratio)));
+      ff_w = 25 - zero_w;
+    }
+  };
 
-    try {
-      ChunkPayload payload(chunk.payload_data);
-      if (payload.type_raw != 0) // 僅處理 stream 影音
-        continue;
+  Chunk chunk;
+  while (reader.read_next(chunk)) {
+    total_chunks_read++;
+    batch_chunks_read++;
 
-      size_t payload_size =
-          chunk.payload_size - payload.data_offset - payload.padding;
+    // 暫存第一包視訊資料供驗證
+    if (first_video_packet.empty() &&
+        std::memcmp(chunk.magic, "@SFV", 4) == 0 && chunk.type_raw == 0 &&
+        chunk.payload_data.size() >=
+            static_cast<size_t>(chunk.data_offset + chunk.padding)) {
+      first_video_packet.assign(chunk.payload_data.begin() + chunk.data_offset,
+                                chunk.payload_data.end() - chunk.padding);
+    }
 
-      // 檢查 payload 大小是否達到加密最小門檻 (扣除 0x40 後 >= 0x200)
-      if (payload_size < 0x40 + 0x200)
-        continue;
+    accumulate_chunk_statistics(chunk, unigram, bigram, sample_rows,
+                                odd_bigram_zero, odd_bigram_ff);
 
-      if (payload_size < 0x140)
-        continue;
+    // 每讀滿 100 個 Chunk 嘗試一次收斂求解
+    if (batch_chunks_read >= BATCH_SIZE) {
+      batch_chunks_read = 0;
+      if (sample_rows > 0) {
+        int zero_weight = 10, ff_weight = 4;
+        calculate_weights(zero_weight, ff_weight);
 
-      size_t encrypted_size = payload_size - 0x140;
-      encrypted_size -= (encrypted_size % 32);
-      if (encrypted_size < 32)
-        continue;
-
-      // payload_data 包含 0..data_offset-1 (header)。實際 payload 在
-      // data_offset 開始。 encrypted_start 距離 payload 起始點 0x140，所以距離
-      // payload_data 起始點是 data_offset + 0x140。
-      size_t start_in_payload_data = payload.data_offset + 0x140;
-
-      const uint8_t *raw_ptr =
-          reinterpret_cast<const uint8_t *>(chunk.payload_data.data());
-      size_t num_blocks = encrypted_size / 32;
-
-      uint8_t current_s[32] = {0};
-
-      for (size_t b = 0; b < num_blocks; ++b) {
-        size_t block_start = start_in_payload_data + b * 32;
-        if (block_start + 32 > chunk.payload_data.size())
-          break;
-
-        for (size_t j = 0; j < 32; ++j) {
-          current_s[j] ^= raw_ptr[block_start + j];
-        }
-
-        if (b % 2 == 0) {
-          sample_rows++;
-          for (size_t j = 0; j < 32; ++j) {
-            unigram[j][current_s[j]]++;
-            unigram[j][current_s[j] ^ 0xFF]++;
-          }
-          for (size_t j = 0; j < 31; ++j) {
-            uint32_t pair_val =
-                (static_cast<uint32_t>(current_s[j]) << 8) | current_s[j + 1];
-            bigram[j][pair_val]++;
-          }
-        } else {
-          for (size_t j = 0; j < 31; ++j) {
-            uint8_t left = current_s[j];
-            uint8_t right = current_s[j + 1];
-            if (left == 0x00 && right == 0x00) {
-              odd_bigram_zero++;
-            } else if (left == 0xFF && right == 0xFF) {
-              odd_bigram_ff++;
-            }
+        std::array<uint8_t, 32> test_vm1{};
+        if (solve_vm1_bigram(unigram, bigram, 50, 300, zero_weight, ff_weight,
+                             test_vm1)) {
+          KeyResult candidate_res = build_key_result(test_vm1);
+          if (test_key_convergence(first_video_packet, candidate_res.key1,
+                                   candidate_res.key2)) {
+            out_key = candidate_res;
+            converged = true;
+            std::cout << "  -> [收斂成功] 在第 " << total_chunks_read
+                      << " 個 Chunk (累積 " << sample_rows
+                      << " 行加密樣本) 成功收斂並驗證金鑰！\n";
+            break;
           }
         }
       }
-    } catch (const std::exception &) {
-      continue;
     }
   }
 
-  if (sample_rows == 0) {
-    std::cerr << "[Crack Error] 找不到足以進行頻率分析的 @SFV 視訊加密區塊。\n";
-    return false;
+  // 處理未滿 100 Chunk 即抵達 EOF 或最後一批次尚未測試的情況
+  if (!converged) {
+    if (sample_rows == 0) {
+      std::cerr
+          << "[Crack Error] 找不到足以進行頻率分析的 @SFV 視訊加密區塊。\n";
+      return false;
+    }
+
+    int zero_weight = 10, ff_weight = 4;
+    calculate_weights(zero_weight, ff_weight);
+
+    std::array<uint8_t, 32> best_vm1{};
+    if (!solve_vm1_bigram(unigram, bigram, 50, 300, zero_weight, ff_weight,
+                          best_vm1)) {
+      std::cerr << "[Crack Error] 束搜尋未找到有效候選金鑰遮罩。\n";
+      return false;
+    }
+
+    out_key = build_key_result(best_vm1);
+    if (!first_video_packet.empty() &&
+        test_key_convergence(first_video_packet, out_key.key1, out_key.key2)) {
+      converged = true;
+      std::cout << "  -> [收斂成功] 在檔案結尾 (共 " << total_chunks_read
+                << " 個 Chunk, 累積 " << sample_rows
+                << " 行加密樣本) 成功收斂並驗證金鑰！\n";
+    } else {
+      std::cout << "  -> [提示] 已讀取至檔案結尾 (共 " << total_chunks_read
+                << " 個 Chunk)，採用最高分候選金鑰。\n";
+    }
   }
 
-  // 估算 Bigram 00 與 FF 權重 (BIGRAM_WEIGHT_TOTAL = 25, ADAPT_MIN_HITS = 100)
-  uint64_t total_hits = odd_bigram_zero + odd_bigram_ff;
-  int zero_weight = 10;
-  int ff_weight = 4;
-
-  if (total_hits >= 100) {
-    double raw_ratio =
-        (odd_bigram_ff > 0)
-            ? (static_cast<double>(odd_bigram_zero) / odd_bigram_ff)
-            : 5.0;
-    double adjusted_ratio = std::max(1.0, std::min(5.0, raw_ratio));
-    zero_weight = static_cast<int>(
-        std::round(25.0 * adjusted_ratio / (1.0 + adjusted_ratio)));
-    ff_weight = 25 - zero_weight;
-  }
-
-  // 執行 6-Stage 束搜尋推導 32-byte VM 遮罩 (beam_size = 50, l1_beam_size =
-  // 300)
-  std::array<uint8_t, 32> best_vm1{};
-  if (!solve_vm1_bigram(unigram, bigram, 50, 300, zero_weight, ff_weight,
-                        best_vm1)) {
-    std::cerr << "[Crack Error] 束搜尋未找到有效候選金鑰遮罩。\n";
-    return false;
-  }
-
-  // 逆向還原 key1 與 key2 (各 4 bytes)
-  uint8_t k1[4] = {best_vm1[0], best_vm1[1], best_vm1[2],
-                   static_cast<uint8_t>((best_vm1[3] + 0x34) & 0xFF)};
-  uint8_t k2[4] = {static_cast<uint8_t>((best_vm1[4] - 0xF9) & 0xFF),
-                   static_cast<uint8_t>(best_vm1[5] ^ 0x13),
-                   static_cast<uint8_t>((best_vm1[6] - 0x61) & 0xFF), 0x00};
-
-  out_key.key1 = (static_cast<uint32_t>(k1[0]) << 24) |
-                 (static_cast<uint32_t>(k1[1]) << 16) |
-                 (static_cast<uint32_t>(k1[2]) << 8) |
-                 static_cast<uint32_t>(k1[3]);
-
-  out_key.key2 = (static_cast<uint32_t>(k2[0]) << 24) |
-                 (static_cast<uint32_t>(k2[1]) << 16) |
-                 (static_cast<uint32_t>(k2[2]) << 8) |
-                 static_cast<uint32_t>(k2[3]);
-
-  out_key.key64 = 0;
-  for (int i = 0; i < 4; ++i) {
-    out_key.key64 |= (static_cast<uint64_t>(k1[i]) << (8 * i));
-  }
-  for (int i = 0; i < 4; ++i) {
-    out_key.key64 |= (static_cast<uint64_t>(k2[i]) << (8 * (4 + i)));
-  }
-
-  // 若 output_video 為 true，進行解密並匯出 IVF 影片
+  // 若 output_video 為 true，進行解密並串流匯出影片
   if (output_video) {
     UsmKeys keys = generate_usm_keys(out_key.key1, out_key.key2);
-    IVF_Stream ivf_stream =
-        preparsed_ivf ? *preparsed_ivf : parse_ivf_stream(chunks, true, &keys);
-    if (preparsed_ivf) {
-      // 若使用傳入的 IVF_Stream，重新解密 packet
-      ivf_stream = parse_ivf_stream(chunks, true, &keys);
-    }
-    if (!export_ivf_file(out_ivf_file, ivf_stream)) {
-      std::cerr << "[Export Error] 無法寫入解密後的 IVF 影片檔至: "
-                << out_ivf_file << "\n";
+    if (!export_file(out_ivf_file, reader, keys)) {
+      std::cerr << "[Export Error] 無法寫入解密後的影片檔至: " << out_ivf_file
+                << "\n";
       return false;
     }
   }
@@ -955,14 +820,12 @@ int main(int argc, char *argv[]) {
   std::string ivf_file = (argc >= 3) ? argv[2] : "outputV.ivf";
   bool explicit_keys = (argc >= 5);
 
-  // 1. 第一層解析：解出 Chunk vector
-  std::cout << "[層級 1] 解析 USM 區塊結構...\n";
-  std::vector<ChunkHeader> chunks = parse_usm_chunks(usm_file);
-  if (chunks.empty()) {
-    std::cerr << "錯誤：讀取或解析 USM 檔案失敗。\n";
+  // 初始化串流讀取器
+  UsmReader reader(usm_file);
+  if (!reader.is_open()) {
+    std::cerr << "錯誤：無法開啟 USM 檔案或檔案過小: " << usm_file << "\n";
     return 1;
   }
-  std::cout << "  -> 成功解出 " << chunks.size() << " 個 Chunk 區塊。\n";
 
   KeyResult key_result;
 
@@ -970,8 +833,6 @@ int main(int argc, char *argv[]) {
     try {
       key_result.key1 = static_cast<uint32_t>(std::stoul(argv[3], nullptr, 16));
       key_result.key2 = static_cast<uint32_t>(std::stoul(argv[4], nullptr, 16));
-      key_result.key64 =
-          (static_cast<uint64_t>(key_result.key1) << 32) | key_result.key2;
     } catch (const std::exception &e) {
       std::cerr << "錯誤：key1 / key2 必須為十六進位數字 (" << e.what()
                 << ")\n";
@@ -981,20 +842,19 @@ int main(int argc, char *argv[]) {
               << key_result.key1 << ", Key2: 0x" << key_result.key2 << std::dec
               << "\n";
 
-    UsmKeys keys = generate_usm_keys(key_result.key64);
-    IVF_Stream ivf_stream = parse_ivf_stream(chunks, true, &keys);
-    if (!export_ivf_file(ivf_file, ivf_stream)) {
-      std::cerr << "錯誤：寫入 IVF 檔案失敗。\n";
+    UsmKeys keys = generate_usm_keys(key_result.key1, key_result.key2);
+    if (!export_file(ivf_file, reader, keys)) {
+      std::cerr << "錯誤：寫入影片檔案失敗。\n";
       return 1;
     }
-    std::cout << "解密並還原 IVF 影片成功： " << ivf_file << "\n";
+    std::cout << "解密並還原影片成功： " << ivf_file << "\n";
   } else {
     bool output_video = (argc >= 3);
     std::cout
-        << "[模式] 啟動自動金鑰破解演算法 (Unigram/Bigram Beam Search)...\n";
+        << "[模式] 啟動串流動態收斂金鑰破解演算法 (Batch Beam Search)...\n";
 
     // 調用核心破解函式
-    if (crack_usm_key(chunks, output_video, key_result, ivf_file)) {
+    if (crack_usm_key(reader, output_video, key_result, ivf_file)) {
       std::cout << "\n========================================\n";
       std::cout << " [Crack Success] 成功破解 USM 金鑰！\n";
       std::cout << "  Key1   : 0x" << std::hex << std::uppercase
